@@ -1,0 +1,29 @@
+name: Update DSE screener
+on:
+  schedule:
+    - cron: "45 9 * * 0-4"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency: { group: pages, cancel-in-progress: true }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: { name: github-pages, url: "${{ steps.deploy.outputs.page_url }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pandas numpy requests lxml
+      - uses: actions/cache@v4
+        with:
+          path: dse_history.csv
+          key: dse-history-${{ github.run_id }}
+          restore-keys: dse-history-
+      - run: python dse_screener.py
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deploy
+        uses: actions/deploy-pages@v4
