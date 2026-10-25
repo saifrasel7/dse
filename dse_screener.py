@@ -25,7 +25,7 @@ import pandas as pd
 
 # ------------------------------------------------------------------ settings (edit freely)
 TOP_N = 20
-HISTORY_DAYS = 400            # calendar days of history to pull (need 200+ trading days for MA200)
+HISTORY_DAYS = 800            # calendar days of history to pull (need 200+ trading days for MA200)
 MIN_TURNOVER_BDT = 5_000_000  # median daily traded value over last 20 sessions (liquidity filter)
 MIN_TRADED_DAYS_20 = 15       # must have traded on at least this many of the last 20 sessions
 MAX_STALE_DAYS = 5            # skip stocks whose last candle is older than this vs the market's latest
@@ -35,8 +35,10 @@ ROUND_TRIP_COST_PCT = 0.5     # rough brokerage + tax drag used in the "after co
 OUT_FILE = "dse_data.js"
 W_TECH, W_FUND = 0.6, 0.4      # final score = 60% chart/technical + 40% fundamentals (2-week horizon leans on the chart)
 MIN_TECH_FOR_PICK = 40         # a cheap stock with a broken chart is not a 2-week pick
+TRACK_FILE = "track_record.json"   # every published top-20 list is saved here and checked again later
+HZ_SESSIONS = {"short": 10, "medium": 60, "long": 250}   # trading sessions to hold for each horizon
 CACHE_FILE = "dse_history.csv"  # saved history; later runs only download the new days
-CACHE_KEEP_DAYS = 450
+CACHE_KEEP_DAYS = 850
 OVERLAP_DAYS = 5               # re-download the last few days each time to pick up any corrections
 # ------------------------------------------------------------------
 
@@ -365,6 +367,16 @@ def features(df):
     f["turnover20"] = (c * v).rolling(20).median()
     f["traded20"] = (v > 0).rolling(20).sum()
     f["brk_vol"] = v / v.rolling(20).mean().shift(1).replace(0, np.nan)
+    sd = c.rolling(20).std()
+    f["bb_up"], f["bb_lo"] = f["ma20"] + 2 * sd, f["ma20"] - 2 * sd
+    f["bb_pctb"] = (c - f["bb_lo"]) / (f["bb_up"] - f["bb_lo"]).replace(0, np.nan)
+    f["bb_w"] = (f["bb_up"] - f["bb_lo"]) / f["ma20"]
+    f["bb_w_rank"] = f["bb_w"].rolling(120, min_periods=60).rank(pct=True)
+    f["ret60"], f["ret250"] = c.pct_change(60), c.pct_change(250)
+    f["hi250"] = h.rolling(250, min_periods=120).max()
+    f["ma50_up"] = f["ma50"] > f["ma50"].shift(10)
+    f["ma200_up"] = f["ma200"] > f["ma200"].shift(20)
+    f["vol_ann"] = c.pct_change().rolling(250, min_periods=120).std() * np.sqrt(250)
     return f
 
 
@@ -412,6 +424,124 @@ def calibrate(scored, out_path):
     txt = "\n".join(out)
     print(txt)
     open(out_path, "w", encoding="utf-8").write(txt)
+
+
+def _n(x):
+    return x is None or (isinstance(x, float) and np.isnan(x)) or pd.isna(x)
+
+
+def sector_pts(sinfo, n_sectors):
+    if not sinfo or n_sectors < 3:
+        return 7
+    r = (sinfo["rank"] - 1) / max(n_sectors - 1, 1)
+    return 15 if r <= 0.34 else 9 if r <= 0.67 else 3
+
+
+def score_medium(fl, rs, sinfo, n_sec):
+    """~3-month view: trend + relative strength vs the market + nearness to highs + momentum + sector strength (0-100)."""
+    c = fl["close"]
+    trend = 7 * (c > fl["ma50"]) + 6 * (fl["ma20"] > fl["ma50"]) + 6 * bool(fl["ma50_up"]) + (3 if _n(fl["ma200"]) else 6 * (c > fl["ma200"]))
+    rel = 10 if rs is None else 25 if rs >= 0.10 else 20 if rs >= 0.05 else 15 if rs >= 0.02 else 10 if rs >= 0 else 5 if rs >= -0.03 else 0
+    near = (12 if c >= fl["hi60"] * 0.95 else 6 if c >= fl["hi60"] * 0.90 else 0) + (8 if c >= fl["hi20_prev"] * 0.98 else 0)
+    mom = (8 if 50 <= fl["rsi"] < 80 else 0) + (7 if fl["macd_hist"] > 0 else 0)
+    sec = sector_pts(sinfo, n_sec)
+    parts = [["Trend", float(trend), 25], ["Strength vs market", float(rel), 25], ["Near highs", float(near), 20], ["Momentum", float(mom), 15], ["Sector", float(sec), 15]]
+    return float(min(100, sum(x[1] for x in parts))), parts
+
+
+def score_long(fl, rs, beta, sinfo, n_sec):
+    """1-year+ view: long-term trend, stability (low volatility/beta), drawdown from the 52-week high, sector strength (0-100)."""
+    c = fl["close"]
+    trend = (6 if _n(fl["ma200"]) else 12 * (c > fl["ma200"])) + (5 if _n(fl["ma200"]) else 10 * bool(fl["ma200_up"])) + (4 if _n(fl["ma200"]) else 8 * (fl["ma50"] > fl["ma200"]))
+    va = fl["vol_ann"]
+    stab = (6 if _n(va) else 15 if va < 0.30 else 9 if va < 0.45 else 3) + (6 if beta is None else 15 if beta <= 0.9 else 9 if beta <= 1.2 else 3)
+    dd = (c / fl["hi250"] - 1) if not _n(fl["hi250"]) else None
+    strength = (6 if dd is None else 15 if dd >= -0.15 else 9 if dd >= -0.30 else 2) + (4 if rs is None else 10 if rs > 0 else 5 if rs > -0.10 else 0)
+    sec = sector_pts(sinfo, n_sec)
+    parts = [["Long-term trend", float(trend), 30], ["Stability", float(stab), 30], ["Strength", float(strength), 25], ["Sector", float(sec), 15]]
+    return float(min(100, sum(x[1] for x in parts))), parts
+
+
+def fund_score_long(f):
+    """Quality + value + income score for holding a year or more (0-100)."""
+    pts, why = 0.0, []
+    pe, g, roe, dv, de = f.get("pe"), f.get("epsG"), f.get("roe"), f.get("div"), f.get("de")
+    fin = "financ" in str(f.get("sector") or "").lower()
+    if pe is None: pts += 10
+    elif pe <= 0: why.append("loss-making")
+    else:
+        pts += 30 if pe <= 10 else 22 if pe <= 15 else 14 if pe <= 20 else 7 if pe <= 28 else 2
+        if pe <= 15: why.append(f"P/E {pe:.1f}")
+    if roe is None: pts += 10
+    else:
+        pts += 30 if roe >= 20 else 24 if roe >= 15 else 16 if roe >= 10 else 8 if roe >= 5 else 0
+        if roe >= 15: why.append(f"ROE {roe:.0f}%")
+    if dv is None: pts += 5
+    else:
+        pts += 20 if dv >= 6 else 15 if dv >= 4 else 10 if dv >= 2 else 5 if dv > 0 else 0
+        if dv >= 4: why.append(f"yield {dv:.1f}%")
+    if g is None: pts += 5
+    elif g > 150: pts += 8
+    else:
+        pts += 15 if g >= 15 else 11 if g >= 5 else 6 if g >= 0 else 0
+        if g >= 10: why.append(f"EPS {g:+.0f}%")
+    if not fin and de is not None:
+        if de > 150: pts -= 10; why.append("high debt")
+        elif de > 80: pts -= 5
+    return max(0.0, min(100.0, pts)), why
+
+
+def update_track(path, lists_today, date_str):
+    try:
+        tr = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        tr = {"lists": []}
+    have = {(l["date"], l["hz"]) for l in tr["lists"]}
+    for hz, picks in lists_today.items():
+        if picks and (date_str, hz) not in have:
+            tr["lists"].append({"date": date_str, "hz": hz, "picks": [{"code": q["code"], "price": q["price"]} for q in picks]})
+    tr["lists"] = tr["lists"][-400:]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(tr, fh, separators=(",", ":"))
+    return tr
+
+
+def evaluate_track(tr, scored, midx):
+    """For each saved list: buy every pick at the close of the list date, hold N sessions (or until today if it is too early)."""
+    out = {}
+    cost = ROUND_TRIP_COST_PCT
+    for hz, N in HZ_SESSIONS.items():
+        rows = []
+        for l in sorted([x for x in tr["lists"] if x["hz"] == hz], key=lambda x: x["date"]):
+            d0 = pd.Timestamp(l["date"])
+            m0 = midx.asof(d0)
+            rets, exc, els = [], [], []
+            for pk in l["picks"]:
+                if pk["code"] not in scored or not pk["price"]:
+                    continue
+                df = scored[pk["code"]][0]
+                idx = int(df["date"].searchsorted(d0, side="right")) - 1
+                if idx < 0:
+                    continue
+                el = len(df) - 1 - idx
+                use = min(el, N)
+                r = float(df["close"].iloc[idx + use]) / pk["price"] - 1
+                m1 = midx.asof(df["date"].iloc[idx + use])
+                rets.append(r); exc.append(r - (float(m1) / float(m0) - 1)); els.append(el)
+            if rets and max(els) > 0:
+                rows.append({"date": l["date"], "sessions": int(min(max(els), N)), "done": bool(min(els) >= N), "n": len(rets),
+                             "avgPct": round(float(np.mean(rets)) * 100, 2), "excessPct": round(float(np.mean(exc)) * 100, 2),
+                             "upPct": round(float(np.mean([r > 0 for r in rets])) * 100)})
+        dn = [r for r in rows if r["done"]]
+        summ = None
+        if dn:
+            summ = {"lists": len(dn), "picks": int(sum(r["n"] for r in dn)), "avgPct": round(float(np.mean([r["avgPct"] for r in dn])), 2),
+                    "afterCostsPct": round(float(np.mean([r["avgPct"] for r in dn])) - cost, 2),
+                    "excessPct": round(float(np.mean([r["excessPct"] for r in dn])), 2),
+                    "upPct": round(float(np.mean([r["upPct"] for r in dn]))),
+                    "beatMarketPct": round(float(np.mean([r["excessPct"] > 0 for r in dn])) * 100)}
+        out[hz] = {"days": N, "summary": summ, "lists": rows[-40:], "saved": len([x for x in tr["lists"] if x["hz"] == hz])}
+    return out
 
 
 def explain(f_last, parts_last):
@@ -472,6 +602,9 @@ def main():
 
     cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CACHE_FILE)
     cache = {} if a.full else load_cache(cache_path)
+    if cache and (pd.Timestamp.today() - min(df["date"].iloc[0] for df in cache.values())).days < HISTORY_DAYS - 60:
+        print("Saved history is shorter than the 3-month/1-year views need - downloading the longer history once (takes longer) ...")
+        cache = {}
     if a.csv:
         data = merge_history(cache, load_from_csv(a.csv))
     elif cache:
@@ -523,59 +656,143 @@ def main():
               f"(after ~{ROUND_TRIP_COST_PCT}% costs: {bt['avgAfterCostsPct']}%).")
 
     fund = fetch_fundamentals()
-    picks = []
+
+    # ---- market index (equal-weighted), beta and sector strength ----
+    R = pd.DataFrame({code: df.set_index("date")["close"].pct_change() for code, (df, f, t) in scored.items()}).sort_index()
+    mret = R.clip(-0.1, 0.1).mean(axis=1)
+    midx = (1 + mret.fillna(0)).cumprod()
+    mk60 = float(midx.iloc[-1] / midx.iloc[-61] - 1) if len(midx) > 61 else None
+    mk250 = float(midx.iloc[-1] / midx.iloc[-251] - 1) if len(midx) > 251 else None
+
+    def beta_of(code):
+        sr = R[code].tail(250)
+        m = mret.reindex(sr.index)
+        ok = sr.notna() & m.notna()
+        if ok.sum() < 120:
+            return None
+        sr, m = sr[ok], m[ok]
+        v = float(m.var())
+        return float(np.cov(sr, m)[0, 1] / v) if v else None
+
+    sec_rows = {}
     for (code, sc, df, f, fl, pl) in ranked:
-        if sc < MIN_TECH_FOR_PICK:
-            continue
-        fd, fs, fwhy = fund.get(code), None, []
-        if fund:
-            if fd is None:
-                fs, fwhy = 35.0, ["no fundamentals data"]
-            else:
-                if fd.get("pe") is not None and fd["pe"] <= 0:
-                    continue                      # loss-making: not a 2-week candidate
-                fs, fwhy = fund_score(fd)
-            comb = W_TECH * sc + W_FUND * fs
-        else:
-            comb = sc
-        picks.append((code, comb, sc, fs, fd, fwhy, df, f, fl, pl))
-    picks.sort(key=lambda x: x[1], reverse=True)
+        sct = (fund.get(code) or {}).get("sector")
+        if sct and not pd.isna(fl["ret60"]):
+            sec_rows.setdefault(sct, []).append((float(fl["ret60"]), 0 if pd.isna(fl["ma50"]) else int(fl["close"] > fl["ma50"])))
+    sectors = [{"sector": k, "n": len(v), "ret3mPct": round(float(np.median([x[0] for x in v])) * 100, 1),
+                "aboveMa50Pct": round(100 * sum(x[1] for x in v) / len(v))} for k, v in sec_rows.items() if len(v) >= 3]
+    sectors.sort(key=lambda z: z["ret3mPct"], reverse=True)
+    for k, z in enumerate(sectors, 1):
+        z["rank"] = k
+    SEC = {z["sector"]: z for z in sectors}
+
+    def rel(v, mk):
+        return None if _n(v) or mk is None else float(v) - mk
+
+    def fund_pick(code, fn):
+        fd = fund.get(code)
+        if not fund:
+            return None, None, [], False
+        if fd is None:
+            return None, 35.0, ["no fundamentals data"], True
+        if fd.get("pe") is not None and fd["pe"] <= 0:
+            return fd, None, [], False
+        fs, why = fn(fd)
+        return fd, fs, why, True
+
+    # ---- three horizons ----
+    short, medium, long_ = [], [], []
+    for (code, sc, df, f, fl, pl) in ranked:
+        sinfo = SEC.get((fund.get(code) or {}).get("sector"))
+        beta = beta_of(code)
+        if sc >= MIN_TECH_FOR_PICK:
+            fd, fs, fwhy, ok = fund_pick(code, fund_score)
+            if ok:
+                comb = W_TECH * sc + W_FUND * fs if fund else sc
+                plist = [["Trend", float(pl["trend"]), 30], ["Momentum", float(pl["momentum"]), 30], ["Near highs", float(pl["structure"]), 40]]
+                short.append((code, comb, sc, fs, fd, fwhy, df, f, fl, plist, explain(fl, pl), {k: float(pl[k]) for k in ["trend", "momentum", "volume", "structure", "penalty"]}, beta, sinfo))
+        if not pd.isna(fl["ma200"]) or len(df) >= 120:
+            ms, mparts = score_medium(fl, rel(fl["ret60"], mk60), sinfo, len(sectors))
+            if ms >= 45:
+                fd, fs, fwhy, ok = fund_pick(code, fund_score)
+                if ok:
+                    comb = 0.5 * ms + 0.5 * fs if fund else ms
+                    why = []
+                    r3 = rel(fl["ret60"], mk60)
+                    if r3 is not None and r3 > 0: why.append(f"beating market by {r3 * 100:+.0f}% in 3 mo")
+                    if fl["close"] > fl["ma50"] and fl["ma50_up"]: why.append("above rising MA50")
+                    if sinfo and sinfo["rank"] <= 3: why.append(f"strong sector (#{sinfo['rank']})")
+                    medium.append((code, comb, ms, fs, fd, fwhy, df, f, fl, mparts, ", ".join(why[:3]) or "mixed signals", {}, beta, sinfo))
+            ls, lparts = score_long(fl, rel(fl["ret250"], mk250), beta, sinfo, len(sectors))
+            if ls >= 40 and len(df) >= 150:
+                fd, fs, fwhy, ok = fund_pick(code, fund_score_long)
+                if ok and (fs is None or fs >= 45):
+                    comb = 0.3 * ls + 0.7 * fs if fund else ls
+                    why = []
+                    if beta is not None and beta <= 0.9: why.append(f"beta {beta:.2f}")
+                    if not pd.isna(fl["hi250"]) and fl["close"] >= fl["hi250"] * 0.85: why.append("near 52-wk high")
+                    if not pd.isna(fl["ma200"]) and fl["close"] > fl["ma200"]: why.append("above MA200")
+                    long_.append((code, comb, ls, fs, fd, fwhy, df, f, fl, lparts, ", ".join(why[:3]) or "mixed signals", {}, beta, sinfo))
+    for lst in (short, medium, long_):
+        lst.sort(key=lambda x: x[1], reverse=True)
 
     def rnd(v, d=2):
-        return None if v is None or (isinstance(v, float) and pd.isna(v)) else round(float(v), d)
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v) else round(float(v), d)
 
-    stocks = []
-    for rank, (code, comb, sc, fs, fd, fwhy, df, f, fl, pl) in enumerate(picks[: a.top], 1):
-        last, prev = df.iloc[-1], df.iloc[-2]
-        bars = df.tail(250)
-        reason = explain(fl, pl)
-        if fwhy:
-            reason += " | " + ", ".join(fwhy[:4])
-        stocks.append({
-            "rank": rank, "code": code, "name": (fd or {}).get("name") or code, "sector": (fd or {}).get("sector") or "DSE",
-            "price": round(float(last["close"]), 2),
-            "changePct": round(float((last["close"] / prev["close"] - 1) * 100), 2),
-            "score": round(comb, 1), "techScore": round(sc, 1), "fundScore": None if fs is None else round(fs, 1),
-            "rec": "Strong pick" if comb >= 72 else ("Good pick" if comb >= 60 else "Watch"),
-            "reason": reason,
-            "fund": None if not fd else {"pe": rnd(fd.get("pe")), "epsG": rnd(fd.get("epsG"), 1), "roe": rnd(fd.get("roe"), 1),
-                                         "div": rnd(fd.get("div")), "de": rnd(fd.get("de"), 0), "netMargin": rnd(fd.get("netMargin"), 1),
-                                         "mcap": rnd(fd.get("mcap"), 0)},
-            "rsi": round(float(fl["rsi"]), 1),
-            "ma50": None if pd.isna(fl["ma50"]) else round(float(fl["ma50"]), 2),
-            "ma200": None if pd.isna(fl["ma200"]) else round(float(fl["ma200"]), 2),
-            "volRatio": None if pd.isna(fl["vol_ratio"]) else round(float(fl["vol_ratio"]), 2),
-            "ret5Pct": None if pd.isna(fl["ret5"]) else round(float(fl["ret5"] * 100), 1),
-            "turnoverM": round(float(fl["turnover20"]) / 1e6, 1),
-            "parts": {k: round(float(pl[k]), 0) for k in ["trend", "momentum", "volume", "structure", "penalty"]},
-            "bars": [[r.date.strftime("%Y-%m-%d"), round(r.open, 2), round(r.high, 2), round(r.low, 2), round(r.close, 2), int(r.volume)]
-                     for r in bars.itertuples()],
-        })
+    used = set()
 
+    def mk(picks):
+        out = []
+        for rank, (code, comb, sc, fs, fd, fwhy, df, f, fl, plist, reason, parts, beta, sinfo) in enumerate(picks[: a.top], 1):
+            last, prev = df.iloc[-1], df.iloc[-2]
+            if fwhy:
+                reason += " | " + ", ".join(fwhy[:4])
+            used.add(code)
+            out.append({
+                "rank": rank, "code": code, "name": (fd or {}).get("name") or code, "sector": (fd or {}).get("sector") or "DSE",
+                "price": round(float(last["close"]), 2),
+                "changePct": round(float((last["close"] / prev["close"] - 1) * 100), 2),
+                "score": round(comb, 1), "techScore": round(sc, 1), "fundScore": None if fs is None else round(fs, 1),
+                "rec": "Strong pick" if comb >= 72 else ("Good pick" if comb >= 60 else "Watch"),
+                "reason": reason,
+                "fund": None if not fd else {"pe": rnd(fd.get("pe")), "epsG": rnd(fd.get("epsG"), 1), "roe": rnd(fd.get("roe"), 1),
+                                             "div": rnd(fd.get("div")), "de": rnd(fd.get("de"), 0), "netMargin": rnd(fd.get("netMargin"), 1),
+                                             "mcap": rnd(fd.get("mcap"), 0)},
+                "rsi": round(float(fl["rsi"]), 1),
+                "ma50": rnd(fl["ma50"]), "ma200": rnd(fl["ma200"]),
+                "volRatio": rnd(fl["vol_ratio"]),
+                "ret5Pct": rnd(fl["ret5"] * 100, 1),
+                "turnoverM": round(float(fl["turnover20"]) / 1e6, 1),
+                "parts": {k: round(v, 0) for k, v in parts.items()},
+                "partsList": [[n, round(v), m] for n, v, m in plist],
+                "bb": {"pctB": rnd(fl["bb_pctb"], 2), "widthPct": rnd(fl["bb_w"] * 100, 1),
+                       "squeeze": bool(fl["bb_w_rank"] <= 0.2) if not pd.isna(fl["bb_w_rank"]) else False,
+                       "upper": rnd(fl["bb_up"]), "lower": rnd(fl["bb_lo"])},
+                "beta": rnd(beta, 2), "ret3mPct": rnd(fl["ret60"] * 100, 1), "ret1yPct": rnd(fl["ret250"] * 100, 1),
+                "fromHighPct": rnd((fl["close"] / fl["hi250"] - 1) * 100, 1), "volAnnPct": rnd(fl["vol_ann"] * 100, 0),
+                "sectorInfo": sinfo,
+            })
+        return out
+
+    h_short, h_med, h_long = mk(short), mk(medium), mk(long_)
+    stocks = h_short
+    bars = {}
+    for code in used:
+        df = scored[code][0]
+        bars[code] = [[r.date.strftime("%Y-%m-%d"), round(r.open, 2), round(r.high, 2), round(r.low, 2), round(r.close, 2), int(r.volume)]
+                      for r in df.tail(250).itertuples()]
+
+    tr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), TRACK_FILE)
+    track = update_track(tr_path, {"short": h_short, "medium": h_med, "long": h_long}, market_last.strftime("%Y-%m-%d"))
+    track_eval = evaluate_track(track, scored, midx)
     payload = {
+        "track": track_eval,
         "generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "latestDate": market_last.strftime("%Y-%m-%d"),
         "scanned": len(scored), "passed": len(ranked), "backtest": bt, "stocks": stocks, "hasFundamentals": bool(fund), "weights": {"tech": W_TECH, "fund": W_FUND},
+        "horizons": {"short": h_short, "medium": h_med, "long": h_long}, "bars": bars, "sectors": sectors,
+        "hzWeights": {"short": [0.6, 0.4], "medium": [0.5, 0.5], "long": [0.3, 0.7]},
+        "marketRet": {"m3Pct": None if mk60 is None else round(mk60 * 100, 1), "y1Pct": None if mk250 is None else round(mk250 * 100, 1)},
         "market": {"advancers": int(adv), "decliners": int(dec), "unchanged": int(flat),
                    "aboveMa50Pct": round(100 * a50 / n50, 1) if n50 else None,
                    "aboveMa200Pct": round(100 * a200 / n200, 1) if n200 else None},
