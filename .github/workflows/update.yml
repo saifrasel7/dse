@@ -2,9 +2,11 @@ name: Update DSE screener
 on:
   schedule:
     - cron: "45 9 * * 0-4"
+    - cron: "0 14 * * 0-4"
+    - cron: "0 4 * * 0-4"
   workflow_dispatch: {}
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 concurrency: { group: pages, cancel-in-progress: true }
@@ -23,6 +25,12 @@ jobs:
           key: dse-history-${{ github.run_id }}
           restore-keys: dse-history-
       - run: python dse_screener.py
+      - name: Save track record
+        run: |
+          git config user.name "dse-bot"
+          git config user.email "dse-bot@users.noreply.github.com"
+          git add track_record.json
+          git diff --cached --quiet || (git commit -m "Update track record" && git push)
       - uses: actions/upload-pages-artifact@v3
         with: { path: site }
       - id: deploy
